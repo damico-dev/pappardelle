@@ -102,8 +102,8 @@ if [[ ! -d "$WORKTREE_PATH" ]]; then
         git worktree add "$WORKTREE_PATH" "$ISSUE_KEY" >&2 2>&1
     else
         # Detect default branch (main or master)
-        DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
-        DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
+        DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+        DEFAULT_BRANCH="${DEFAULT_BRANCH#refs/remotes/origin/}"
         if [[ -z "$DEFAULT_BRANCH" ]]; then
             # Fallback: check which branch exists on remote
             if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
@@ -119,10 +119,10 @@ if [[ ! -d "$WORKTREE_PATH" ]]; then
         # of what's checked out, and silently mutating the main repo can revert
         # merged commits when a stale auto-stash later pops over a newer master.
         log "Fetching latest $DEFAULT_BRANCH..."
-        git fetch --no-tags --no-recurse-submodules origin "$DEFAULT_BRANCH" --quiet >&2 2>&1
+        git fetch --no-recurse-submodules origin "$DEFAULT_BRANCH" --quiet >&2 2>&1
 
         log "Preparing worktree (new branch '$ISSUE_KEY')"
-        git worktree add "$WORKTREE_PATH" -b "$ISSUE_KEY" "origin/$DEFAULT_BRANCH" >&2 2>&1
+        git worktree add "$WORKTREE_PATH" -b "$ISSUE_KEY" "refs/remotes/origin/$DEFAULT_BRANCH" >&2 2>&1
     fi
     log "Worktree created with branch $ISSUE_KEY"
 else

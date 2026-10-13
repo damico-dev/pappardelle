@@ -33,6 +33,7 @@ function setup(t: ExecutionContext) {
 	const launchArgs = path.join(root, 'launch-args');
 	const vcsCalls = path.join(root, 'vcs-calls');
 	const configCalls = path.join(root, 'config-calls');
+	const openCalls = path.join(root, 'open-calls');
 	const yq = execFileSync('which', ['yq'], {encoding: 'utf8'}).trim();
 	const launchers = path.join(root, 'launchers');
 	for (const dir of [main, scripts, bin, home]) fs.mkdirSync(dir);
@@ -85,10 +86,18 @@ function setup(t: ExecutionContext) {
 		'test -f "$IDOW_TEST_LAUNCH_ARGS"\nprintf "%s\\n" "$*" >> "$IDOW_TEST_VCS_CALLS"\nprintf "%s\\n" "https://github.com/test/repo/pull/1"',
 	);
 	writeScript(path.join(bin, 'tmux'), 'exit 1');
-	writeScript(path.join(bin, 'open'), 'exit 0');
+	writeScript(
+		path.join(bin, 'open'),
+		'printf "%s\\n" "$@" >> "$IDOW_TEST_OPEN_CALLS"',
+	);
 	writeScript(
 		path.join(bin, 'yq'),
-		'printf "%s\\n" "$1" >> "$IDOW_TEST_CONFIG_CALLS"\nexec "$IDOW_TEST_YQ" "$@"',
+		`printf "%s\\n" "$1" >> "$IDOW_TEST_CONFIG_CALLS"
+if [[ "\${IDOW_TEST_FAIL_PR_INSPECTION:-}" == true && "$2" == *'hooks.post_workspace_create]'* ]]; then
+    printf 'partial inspection output\\n'
+    exit 1
+fi
+exec "$IDOW_TEST_YQ" "$@"`,
 	);
 	writeScript(
 		path.join(scripts, 'start-claude-session.sh'),
@@ -148,6 +157,7 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 		launchArgs,
 		vcsCalls,
 		configCalls,
+		openCalls,
 		launchers,
 		home,
 		config,
@@ -194,6 +204,7 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 							IDOW_TEST_LAUNCH_ARGS: launchArgs,
 							IDOW_TEST_VCS_CALLS: vcsCalls,
 							IDOW_TEST_CONFIG_CALLS: configCalls,
+							IDOW_TEST_OPEN_CALLS: openCalls,
 							IDOW_TEST_YQ: yq,
 							IDOW_TEST_LAUNCHERS: launchers,
 							...extraEnv,
@@ -458,9 +469,10 @@ test('opening without PR consumers skips VCS lookup', async t => {
 		path.join(fixture.main, '.pappardelle.local.yml'),
 		YAML.dump({profiles: {dev: {links: []}}}),
 	);
-	await fixture.run({open: true});
+	const output = await fixture.run({open: true});
 	t.false(fs.existsSync(fixture.vcsCalls));
 	t.true(fs.existsSync(fixture.launchArgs));
+	t.false(output.includes('PR:'));
 });
 
 test('newly created issues launch fresh; existing keys keep conversation resume', async t => {
@@ -479,14 +491,16 @@ test('batched commands preserve order, multiline strings and command stdin', asy
 		YAML.dump({
 			post_workspace_init: [
 				// Reading stdin must not consume the next command's config record.
-				{run: 'cat > "${WORKTREE_PATH}/stdin"'},
+				{name: 'Read stdin\n\n', run: 'cat > "${WORKTREE_PATH}/stdin"'},
 				{run: `printf '%s' '${expected}' > "\${WORKTREE_PATH}/value"`},
 				{run: 'false', continue_on_error: true},
 				{run: 'printf done >> "${WORKTREE_PATH}/value"'},
 			],
 		}),
 	);
-	await fixture.run();
+	const output = await fixture.run();
+	t.true(output.includes('Read stdin\n'), output);
+	t.false(output.includes('Read stdin\n\n'), output);
 	t.is(fs.readFileSync(path.join(fixture.workspace, 'stdin'), 'utf8'), '');
 	t.is(
 		fs.readFileSync(path.join(fixture.workspace, 'value'), 'utf8'),
@@ -565,3 +579,116 @@ for (const consumer of ['profile vars', 'post-create hook']) {
 		);
 	});
 }
+
+for (const consumer of ['links', 'apps']) {
+	test.serial(
+		`PR lookup sees YAML aliases in ${consumer} after merging layers`,
+		async t => {
+			const fixture = setup(t);
+			const entry =
+				consumer === 'links'
+					? "  - url: '${PR_URL}'\n    if_set: PR_URL"
+					: '  - name: Save PR\n    command: \'printf %s "${PR_URL}" > "${WORKTREE_PATH}/pr"\'\n    if_set: PR_URL';
+			fs.writeFileSync(
+				path.join(fixture.main, '.pappardelle.yml'),
+				`common_entries: &entries\n${entry}\nversion: 1\nteam_prefix: test\nissue_tracker:\n  provider: beads\ndefault_profile: dev\nterminal:\n  app: none\nprofiles:\n  dev:\n${consumer === 'apps' ? '    links: []\n' : ''}    ${consumer}: *entries\n`,
+			);
+			const output = await fixture.run({open: true});
+			const url = 'https://github.com/test/repo/pull/1';
+			t.true(output.includes(`PR:        ${url}`), output);
+			t.is(
+				consumer === 'links'
+					? fs.readFileSync(fixture.openCalls, 'utf8').trim()
+					: fs.readFileSync(path.join(fixture.workspace, 'pr'), 'utf8'),
+				url,
+			);
+		},
+	);
+}
+
+test.serial(
+	'a failed PR consumer inspection falls back to VCS lookup',
+	async t => {
+		const fixture = setup(t);
+		fs.appendFileSync(
+			path.join(fixture.main, '.pappardelle.local.yml'),
+			YAML.dump({profiles: {dev: {links: []}}}),
+		);
+		const output = await fixture.run({
+			open: true,
+			extraEnv: {IDOW_TEST_FAIL_PR_INSPECTION: 'true'},
+		});
+		t.true(fs.existsSync(fixture.vcsCalls));
+		t.true(output.includes('PR:        https://github.com/test/repo/pull/1'));
+	},
+);
+
+test.serial('block-scalar launch settings strip trailing newlines', async t => {
+	const fixture = setup(t);
+	fs.writeFileSync(
+		path.join(fixture.main, '.pappardelle.local.yml'),
+		`claude:
+  initialization_command: |+
+    /do
+
+  model: |
+    opus
+  effort: >
+    high
+companion_command: |
+  echo companion
+`,
+	);
+	await fixture.run();
+	const args = fs
+		.readFileSync(fixture.launchArgs, 'utf8')
+		.split('\n')
+		.slice(0, -1);
+	for (const [flag, value] of [
+		['--init-cmd', '/do'],
+		['--model', 'opus'],
+		['--effort', 'high'],
+		['--companion-command', 'echo companion'],
+	]) {
+		t.true(args.includes(flag));
+		t.is(args[args.indexOf(flag) + 1], value);
+	}
+	t.false(
+		args.includes(''),
+		'launch settings must not contain trailing newlines',
+	);
+});
+
+test.serial(
+	'block-scalar app/link conditions and titles keep the previous field behavior',
+	async t => {
+		const fixture = setup(t);
+		fs.appendFileSync(
+			path.join(fixture.main, '.pappardelle.local.yml'),
+			`profiles:
+  dev:
+    apps:
+      - name: |
+          Block app
+        command: |
+          printf '%s' "\${PR_URL}" > "\${WORKTREE_PATH}/app"
+        if_set: |
+          PR_URL
+    links:
+      - title: |+
+          Block link
+
+        url: |
+          \${PR_URL}
+        if_set: |
+          PR_URL
+`,
+		);
+		const output = await fixture.run({open: true});
+		const url = 'https://github.com/test/repo/pull/1';
+		t.is(fs.readFileSync(path.join(fixture.workspace, 'app'), 'utf8'), url);
+		t.is(fs.readFileSync(fixture.openCalls, 'utf8'), `${url}\n`);
+		t.true(output.includes(`Link: Block link -> ${url}`), output);
+		t.true(output.includes('Block app opened (command)'), output);
+	},
+);

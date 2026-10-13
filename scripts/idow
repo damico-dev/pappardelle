@@ -188,15 +188,27 @@ CONFIG_PATH="$MERGED_CONFIG_PATH"
 TERMINAL_OPEN_FAILED=false
 
 # Read selected records as NUL-delimited fields. One YAML parse handles an
-# entire command/app/link list, preserving empty strings, tabs and newlines.
+# entire command/app/link list, preserving empty strings, tabs and internal
+# newlines. Strip trailing newlines to match the previous $(...) field reads.
 # Only selected fields pass through JSON, so unrelated YAML-only values remain
 # valid. Field values are read as data, never evaluated as shell assignments.
 config_records() (
     # Validate the whole list before running any command. A process substitution
     # would hide parser failures and could silently skip required setup steps.
     set -o pipefail
-    yq -o=json "$1" "$CONFIG_PATH" | jq -j '.[] | .[] | tostring + "\u0000"' > "$CONFIG_RECORDS_PATH"
+    yq -o=json "$1" "$CONFIG_PATH" | jq -j '.[] | .[] | (tostring | sub("\n+$"; "")) + "\u0000"' > "$CONFIG_RECORDS_PATH"
 )
+
+# Expand aliases before inspecting consumers, retaining YAML-only values that
+# cannot be serialized as JSON. On inspection failure, keep the old lookup
+# behavior rather than silently dropping a configured PR link.
+profile_uses_pr_url() {
+    local consumers
+    if ! consumers=$(yq -r "explode(.) | [.profiles.$SELECTED_PROFILE.vars, .profiles.$SELECTED_PROFILE.commands, .profiles.$SELECTED_PROFILE.apps, .profiles.$SELECTED_PROFILE.links, .hooks.post_workspace_create]" "$CONFIG_PATH"); then
+        return 0
+    fi
+    [[ "$consumers" == *PR_URL* || "$consumers" == *MR_URL* ]]
+}
 
 # Detect configured providers
 TRACKER_PROVIDER=$(get_issue_tracker_provider "$CONFIG_PATH")
@@ -601,7 +613,7 @@ CLAUDE_CONFIG_JSON=$("$SCRIPT_DIR/resolve-claude-config.sh" --config "$CONFIG_PA
     IFS= read -r -d '' CLAUDE_MODEL
     IFS= read -r -d '' CLAUDE_EFFORT
     IFS= read -r -d '' COMPANION_COMMAND
-} < <(printf '%s\n' "$CLAUDE_CONFIG_JSON" | jq -j '[.init_cmd, .skip_permissions, .model, .effort, .companion_command][] + "\u0000"')
+} < <(printf '%s\n' "$CLAUDE_CONFIG_JSON" | jq -j '[.init_cmd, .skip_permissions, .model, .effort, .companion_command][] | sub("\n+$"; "") + "\u0000"')
 PROFILE_INIT_CMD=$(yq -r ".profiles.$SELECTED_PROFILE.claude.initialization_command // \"\"" "$CONFIG_PATH")
 if [[ -n "$PROFILE_INIT_CMD" ]]; then
     INIT_CMD="$PROFILE_INIT_CMD"
@@ -677,6 +689,8 @@ else
     WORKTREE_JSON=$("$SCRIPT_DIR/create-worktree.sh" "${CREATE_WORKTREE_ARGS[@]}") || error "Failed to create worktree"
     WORKTREE_PATH=$(echo "$WORKTREE_JSON" | jq -r '.worktree_path')
     print_success "Created worktree: $WORKTREE_PATH"
+    # Existing issue keys may have resumable history even after their worktree
+    # was deleted; only a newly created issue is guaranteed to have none.
     FRESH_WORKSPACE="$IS_NEW_ISSUE"
 
     # Persist the resolved profile to space-state so the Pappardelle TUI can
@@ -728,10 +742,10 @@ else
 
     # Run post_workspace_init commands from config (falls back to legacy post_worktree_init)
     POST_INIT_KEY="post_workspace_init"
-    POST_INIT_COUNT=$(yq -r '.post_workspace_init | length // 0' "$CONFIG_PATH" 2>/dev/null)
+    POST_INIT_COUNT=$(yq -r '.post_workspace_init | explode(.) | length // 0' "$CONFIG_PATH" 2>/dev/null)
     if [[ "$POST_INIT_COUNT" -eq 0 ]]; then
         POST_INIT_KEY="post_worktree_init"
-        POST_INIT_COUNT=$(yq -r '.post_worktree_init | length // 0' "$CONFIG_PATH" 2>/dev/null)
+        POST_INIT_COUNT=$(yq -r '.post_worktree_init | explode(.) | length // 0' "$CONFIG_PATH" 2>/dev/null)
     fi
     if [[ "$POST_INIT_COUNT" -gt 0 ]]; then
         log "Running $POST_INIT_COUNT $POST_INIT_KEY command(s)..."
@@ -751,10 +765,10 @@ else
 
     # Run profile-specific post_workspace_init commands (falls back to legacy post_worktree_init)
     PROFILE_POST_INIT_KEY="post_workspace_init"
-    PROFILE_POST_INIT_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.post_workspace_init | length // 0" "$CONFIG_PATH" 2>/dev/null)
+    PROFILE_POST_INIT_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.post_workspace_init | explode(.) | length // 0" "$CONFIG_PATH" 2>/dev/null)
     if [[ "$PROFILE_POST_INIT_COUNT" -eq 0 ]]; then
         PROFILE_POST_INIT_KEY="post_worktree_init"
-        PROFILE_POST_INIT_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.post_worktree_init | length // 0" "$CONFIG_PATH" 2>/dev/null)
+        PROFILE_POST_INIT_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.post_worktree_init | explode(.) | length // 0" "$CONFIG_PATH" 2>/dev/null)
     fi
     if [[ "$PROFILE_POST_INIT_COUNT" -gt 0 ]]; then
         log "Running $PROFILE_POST_INIT_COUNT profile $PROFILE_POST_INIT_KEY command(s)..."
@@ -820,7 +834,7 @@ else
 
 # Resolve a PR only when an open command, app, link or hook consumes it.
 # Start the sessions first so a slow VCS host cannot delay Claude's launch.
-if yq -r "[.profiles.$SELECTED_PROFILE.vars, .profiles.$SELECTED_PROFILE.commands, .profiles.$SELECTED_PROFILE.apps, .profiles.$SELECTED_PROFILE.links, .hooks.post_workspace_create]" "$CONFIG_PATH" | grep -qE 'PR_URL|MR_URL'; then
+if profile_uses_pr_url; then
     print_step 7 "Looking for an existing PR/MR ($VCS_PROVIDER)..."
     PR_URL=$(check_existing_pr "$CONFIG_PATH")
     if [[ -n "$PR_URL" ]]; then
@@ -833,7 +847,7 @@ fi
 # Step 8: Run profile commands BEFORE opening apps (so xcodegen, etc. are ready)
 print_step 8 "Running profile commands..."
 
-CMD_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.commands | length // 0" "$CONFIG_PATH" 2>/dev/null)
+CMD_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.commands | explode(.) | length // 0" "$CONFIG_PATH" 2>/dev/null)
 if [[ "$CMD_COUNT" -gt 0 ]]; then
     config_records "[(.profiles.$SELECTED_PROFILE.commands // [])[] | [.name // \"\", .run // \"\", .continue_on_error // false, .background // false]]"
     i=0
@@ -921,7 +935,7 @@ fi
 # Step 10: Open apps from profile
 print_step 10 "Opening profile apps..."
 
-APP_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.apps | length // 0" "$CONFIG_PATH" 2>/dev/null)
+APP_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.apps | explode(.) | length // 0" "$CONFIG_PATH" 2>/dev/null)
 if [[ "$APP_COUNT" -gt 0 ]]; then
     config_records "[(.profiles.$SELECTED_PROFILE.apps // [])[] | [.name // \"\", .path // \"\", .command // \"\", .if_set // \"\"]]"
     while IFS= read -r -u 3 -d '' APP_NAME &&
@@ -967,7 +981,7 @@ fi
 # Step 11: Open links from profile
 print_step 11 "Opening profile links..."
 
-LINK_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.links | length // 0" "$CONFIG_PATH" 2>/dev/null)
+LINK_COUNT=$(yq -r ".profiles.$SELECTED_PROFILE.links | explode(.) | length // 0" "$CONFIG_PATH" 2>/dev/null)
 if [[ "$LINK_COUNT" -gt 0 ]]; then
     LINK_URLS=()
     config_records "[(.profiles.$SELECTED_PROFILE.links // [])[] | [.url // \"\", .title // \"\", .if_set // \"\"]]"
@@ -998,7 +1012,7 @@ else
 fi
 
 # Global post_workspace_create hooks (run after everything is open so windows exist)
-HOOK_COUNT=$(yq -r '.hooks.post_workspace_create | length // 0' "$CONFIG_PATH" 2>/dev/null)
+HOOK_COUNT=$(yq -r '.hooks.post_workspace_create | explode(.) | length // 0' "$CONFIG_PATH" 2>/dev/null)
 if [[ "$HOOK_COUNT" -gt 0 ]]; then
     log "Running $HOOK_COUNT post_workspace_create hook(s)..."
     config_records "[(.hooks.post_workspace_create // [])[] | [.name // \"\", .run // \"\", .continue_on_error // false, .background // false]]"
