@@ -178,6 +178,20 @@ assert_main_repo_unchanged "clean repo"
 
 teardown_repo
 
+# Existing issue branches do not depend on origin's default branch. Reopening
+# one should work immediately even when the remote is unreachable.
+echo -e "\n${BOLD}Test: reuses an existing branch without fetching${RESET}"
+setup_repo
+git -C "$MAIN_REPO" branch STA-150
+git -C "$MAIN_REPO" remote set-url origin "$TMPDIR_ROOT/missing-origin.git"
+snapshot_main_repo
+OUTPUT=$("$SCRIPT_DIR/create-worktree.sh" --issue-key STA-150 --project-key test 2>/dev/null)
+assert_valid_json "offline branch reuse succeeds" "$OUTPUT"
+assert_eq "reused branch preserves its commit" "$SNAPSHOT_HEAD" \
+    "$(git -C "$WORKTREES_ROOT/repo/STA-150" rev-parse HEAD)"
+assert_main_repo_unchanged "offline branch reuse"
+teardown_repo
+
 # ==========================================================================
 
 echo -e "\n${BOLD}Test: create-worktree with uncommitted changes (no auto-stash, no checkout)${RESET}"

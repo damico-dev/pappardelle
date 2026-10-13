@@ -32,6 +32,8 @@ function setup(t: ExecutionContext) {
 	const workspace = path.join(root, 'new workspace');
 	const launchArgs = path.join(root, 'launch-args');
 	const vcsCalls = path.join(root, 'vcs-calls');
+	const configCalls = path.join(root, 'config-calls');
+	const yq = execFileSync('which', ['yq'], {encoding: 'utf8'}).trim();
 	const launchers = path.join(root, 'launchers');
 	for (const dir of [main, scripts, bin, home]) fs.mkdirSync(dir);
 	const git = (...args: string[]) =>
@@ -53,6 +55,7 @@ function setup(t: ExecutionContext) {
 		'provider-helpers.sh',
 		'resolve-claude-config.sh',
 		'resolve-terminal-app.sh',
+		'derive-title.sh',
 	]) {
 		fs.copyFileSync(path.join(scriptsDir, file), path.join(scripts, file));
 	}
@@ -79,9 +82,14 @@ function setup(t: ExecutionContext) {
 	);
 	writeScript(
 		path.join(bin, 'gh'),
-		'printf "%s\\n" "$*" >> "$IDOW_TEST_VCS_CALLS"\nprintf "%s\\n" "https://github.com/test/repo/pull/1"',
+		'test -f "$IDOW_TEST_LAUNCH_ARGS"\nprintf "%s\\n" "$*" >> "$IDOW_TEST_VCS_CALLS"\nprintf "%s\\n" "https://github.com/test/repo/pull/1"',
 	);
 	writeScript(path.join(bin, 'tmux'), 'exit 1');
+	writeScript(path.join(bin, 'open'), 'exit 0');
+	writeScript(
+		path.join(bin, 'yq'),
+		'printf "%s\\n" "$1" >> "$IDOW_TEST_CONFIG_CALLS"\nexec "$IDOW_TEST_YQ" "$@"',
+	);
 	writeScript(
 		path.join(scripts, 'start-claude-session.sh'),
 		`printf '%s\\n' "$@" > "$IDOW_TEST_LAUNCH_ARGS"`,
@@ -103,6 +111,7 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 			profiles: {
 				dev: {
 					display_name: displayName,
+					links: [{url: '${PR_URL}', if_set: 'PR_URL'}],
 					post_workspace_init: [
 						{
 							name: 'Profile init',
@@ -138,6 +147,7 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 		workspace,
 		launchArgs,
 		vcsCalls,
+		configCalls,
 		launchers,
 		home,
 		config,
@@ -146,11 +156,13 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 			projectRoot = true,
 			onExit = () => {},
 			extraEnv = {},
+			input,
 		}: {
 			open?: boolean;
 			projectRoot?: boolean;
 			onExit?: () => void;
 			extraEnv?: Record<string, string>;
+			input?: string;
 		} = {}): Promise<string> {
 			const env = {...process.env};
 			delete env.PAPPARDELLE_PROJECT_ROOT;
@@ -165,8 +177,9 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 					[
 						path.join(scripts, 'idow'),
 						...(open ? ['--resume', '--open'] : []),
-						'--issue-key',
-						'test-abc',
+						...(input
+							? ['--profile', 'dev', input]
+							: ['--issue-key', 'test-abc']),
 					],
 					{
 						cwd: projectRoot ? root : linked,
@@ -180,6 +193,8 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 							IDOW_TEST_WORKSPACE: workspace,
 							IDOW_TEST_LAUNCH_ARGS: launchArgs,
 							IDOW_TEST_VCS_CALLS: vcsCalls,
+							IDOW_TEST_CONFIG_CALLS: configCalls,
+							IDOW_TEST_YQ: yq,
 							IDOW_TEST_LAUNCHERS: launchers,
 							...extraEnv,
 						},
@@ -189,6 +204,7 @@ jq -n --arg worktree_path "$IDOW_TEST_WORKSPACE" '{worktree_path: $worktree_path
 						else resolve(stdout);
 					},
 				);
+				child.stdin?.end();
 				child.once('exit', onExit);
 			});
 		},
@@ -427,3 +443,125 @@ test('step 9 hands Ghostty the window captured at startup', async t => {
 		/^ghostty .*--window-id tab-group-test/m,
 	);
 });
+
+test('setup merges config once and does not resolve the terminal', async t => {
+	const fixture = setup(t);
+	await fixture.run();
+	const calls = fs.readFileSync(fixture.configCalls, 'utf8').split('\n');
+	t.is(calls.filter(call => call === 'eval-all').length, 1);
+	t.false(calls.some(call => call.includes('.terminal.app')));
+});
+
+test('opening without PR consumers skips VCS lookup', async t => {
+	const fixture = setup(t);
+	fs.appendFileSync(
+		path.join(fixture.main, '.pappardelle.local.yml'),
+		YAML.dump({profiles: {dev: {links: []}}}),
+	);
+	await fixture.run({open: true});
+	t.false(fs.existsSync(fixture.vcsCalls));
+	t.true(fs.existsSync(fixture.launchArgs));
+});
+
+test('newly created issues launch fresh; existing keys keep conversation resume', async t => {
+	const fixture = setup(t);
+	await fixture.run({input: 'Make workspace startup faster'});
+	t.true(fs.readFileSync(fixture.launchArgs, 'utf8').includes('--fresh\n'));
+	await fixture.run();
+	t.false(fs.readFileSync(fixture.launchArgs, 'utf8').includes('--fresh\n'));
+});
+
+test('batched commands preserve order, multiline strings and command stdin', async t => {
+	const fixture = setup(t);
+	const expected = 'a\tb\nquoted "text" and \u0024(literal)\n';
+	fs.appendFileSync(
+		path.join(fixture.main, '.pappardelle.local.yml'),
+		YAML.dump({
+			post_workspace_init: [
+				// Reading stdin must not consume the next command's config record.
+				{run: 'cat > "${WORKTREE_PATH}/stdin"'},
+				{run: `printf '%s' '${expected}' > "\${WORKTREE_PATH}/value"`},
+				{run: 'false', continue_on_error: true},
+				{run: 'printf done >> "${WORKTREE_PATH}/value"'},
+			],
+		}),
+	);
+	await fixture.run();
+	t.is(fs.readFileSync(path.join(fixture.workspace, 'stdin'), 'utf8'), '');
+	t.is(
+		fs.readFileSync(path.join(fixture.workspace, 'value'), 'utf8'),
+		expected + 'done',
+	);
+});
+
+test('a failing required command still stops setup before Claude starts', async t => {
+	const fixture = setup(t);
+	fs.appendFileSync(
+		path.join(fixture.main, '.pappardelle.local.yml'),
+		YAML.dump({
+			post_workspace_init: [
+				{run: 'false'},
+				{run: 'touch "${WORKTREE_PATH}/unexpected"'},
+			],
+		}),
+	);
+	await t.throwsAsync(fixture.run());
+	t.false(fs.existsSync(fixture.launchArgs));
+	t.false(fs.existsSync(path.join(fixture.workspace, 'unexpected')));
+});
+
+test('adding commands does not add YAML parser processes', async t => {
+	const fixture = setup(t);
+	await fixture.run();
+	const count = fs
+		.readFileSync(fixture.configCalls, 'utf8')
+		.trim()
+		.split('\n').length;
+	fs.writeFileSync(fixture.configCalls, '');
+	fs.appendFileSync(
+		path.join(fixture.main, '.pappardelle.local.yml'),
+		YAML.dump({
+			post_workspace_init: Array.from({length: 20}, () => ({run: ':'})),
+		}),
+	);
+	await fixture.run();
+	t.is(
+		fs.readFileSync(fixture.configCalls, 'utf8').trim().split('\n').length,
+		count,
+	);
+});
+
+for (const consumer of ['profile vars', 'post-create hook']) {
+	test(`PR lookup covers ${consumer}`, async t => {
+		const fixture = setup(t);
+		fs.appendFileSync(
+			path.join(fixture.main, '.pappardelle.local.yml'),
+			YAML.dump({
+				profiles: {
+					dev: {
+						links: [],
+						...(consumer === 'profile vars'
+							? {
+									vars: {
+										SAVE_PR: 'printf "%s" "$PR_URL" > "${WORKTREE_PATH}/pr"',
+									},
+									commands: [{run: '${SAVE_PR}'}],
+								}
+							: {}),
+					},
+				},
+				hooks: {
+					post_workspace_create:
+						consumer === 'post-create hook'
+							? [{run: 'printf "%s" "${MR_URL}" > "${WORKTREE_PATH}/pr"'}]
+							: [],
+				},
+			}),
+		);
+		await fixture.run({open: true});
+		t.is(
+			fs.readFileSync(path.join(fixture.workspace, 'pr'), 'utf8'),
+			'https://github.com/test/repo/pull/1',
+		);
+	});
+}
